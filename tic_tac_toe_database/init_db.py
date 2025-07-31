@@ -1,132 +1,152 @@
 #!/usr/bin/env python3
-"""Initialize SQLite database for tic_tac_toe_database"""
+"""Initialize or migrate the SQLite database for the Tic Tac Toe application.
+
+Creates the following tables with appropriate indices and foreign key constraints:
+- users: id, username, password_hash, score, created_at
+- games: id, player_x_id, player_o_id, winner_id, status, started_at, finished_at
+- moves: id, game_id, user_id, row, col, move_num, created_at
+- scores: user_id, total_games, wins, losses, draws
+
+This script handles schema creation (if not present) and safe application of future schema updates.
+"""
 
 import sqlite3
 import os
+import datetime
 
 DB_NAME = "myapp.db"
-DB_USER = "kaviasqlite"  # Not used for SQLite, but kept for consistency
-DB_PASSWORD = "kaviadefaultpassword"  # Not used for SQLite, but kept for consistency
-DB_PORT = "5000"  # Not used for SQLite, but kept for consistency
+DB_PATH = os.path.abspath(DB_NAME)
+SCHEMA_VERSION = 1  # Increment if/when schema changes
 
-print("Starting SQLite setup...")
+def get_conn():
+    """Get a connection to the SQLite DB enabling foreign keys."""
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
-# Check if database already exists
-db_exists = os.path.exists(DB_NAME)
-if db_exists:
-    print(f"SQLite database already exists at {DB_NAME}")
-    # Verify it's accessible
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("SELECT 1")
-        conn.close()
-        print("Database is accessible and working.")
-    except Exception as e:
-        print(f"Warning: Database exists but may be corrupted: {e}")
-else:
-    print("Creating new SQLite database...")
+# PUBLIC_INTERFACE
+def create_tables(conn):
+    """Create tables for users, games, moves, and scores."""
+    cursor = conn.cursor()
 
-# Create database with sample tables
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
+    # Create schema_migrations table to track applied migrations
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-# Create initial schema
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS app_info (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT UNIQUE NOT NULL,
-        value TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
+    # Create users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            score INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-# Create a sample users table as an example
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
+    # Index on username
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)")
 
-# Insert initial data
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("project_name", "tic_tac_toe_database"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("version", "0.1.0"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("author", "John Doe"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("description", ""))
+    # Create games table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_x_id INTEGER NOT NULL,
+            player_o_id INTEGER NOT NULL,
+            winner_id INTEGER,
+            status TEXT NOT NULL CHECK(status IN ('waiting', 'active', 'finished')),
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP,
+            FOREIGN KEY(player_x_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(player_o_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(winner_id) REFERENCES users(id)
+        )
+    """)
 
-conn.commit()
+    # Index on status for efficient game state queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_games_status ON games (status)")
 
-# Get database statistics
-cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-table_count = cursor.fetchone()[0]
+    # Create moves table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS moves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            row INTEGER NOT NULL CHECK(row BETWEEN 0 AND 2),
+            col INTEGER NOT NULL CHECK(col BETWEEN 0 AND 2),
+            move_num INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+    # Composite index for moves per game
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_moves_gameid ON moves (game_id)")
 
-cursor.execute("SELECT COUNT(*) FROM app_info")
-record_count = cursor.fetchone()[0]
+    # Create scores table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scores (
+            user_id INTEGER PRIMARY KEY,
+            total_games INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            draws INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
 
-conn.close()
+    # Now mark the current schema as applied in migrations table if not already present
+    cursor.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)", (SCHEMA_VERSION,))
 
-# Save connection information to a file
-current_dir = os.getcwd()
-connection_string = f"sqlite:///{current_dir}/{DB_NAME}"
+    conn.commit()
 
-try:
+# PUBLIC_INTERFACE
+def is_schema_up_to_date(conn):
+    """Check if the schema version is already applied."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT MAX(version) FROM schema_migrations")
+    row = cursor.fetchone()
+    return (row and row[0] == SCHEMA_VERSION)
+
+# PUBLIC_INTERFACE
+def initialize_db():
+    """Create SQLite DB and tables if not already present. Migrate if schema outdated."""
+    print("Checking for existing SQLite database ...")
+    db_exists = os.path.exists(DB_NAME)
+    conn = get_conn()
+
+    if not db_exists:
+        print(f"Database will be created at {DB_PATH}")
+    else:
+        print(f"Database found at {DB_PATH}")
+
+    if not is_schema_up_to_date(conn):
+        print("Applying database schema ...")
+        create_tables(conn)
+        print("Schema created or updated successfully.")
+    else:
+        print("Schema already up-to-date.")
+
+    # Save DB connection information for external tools
+    print("Writing connection info ...")
     with open("db_connection.txt", "w") as f:
         f.write(f"# SQLite connection methods:\n")
         f.write(f"# Python: sqlite3.connect('{DB_NAME}')\n")
-        f.write(f"# Connection string: {connection_string}\n")
-        f.write(f"# File path: {current_dir}/{DB_NAME}\n")
-    print("Connection information saved to db_connection.txt")
-except Exception as e:
-    print(f"Warning: Could not save connection info: {e}")
+        f.write(f"# Connection string: sqlite:///{DB_PATH}\n")
+        f.write(f"# File path: {DB_PATH}\n")
 
-# Create environment variables file for Node.js viewer
-db_path = os.path.abspath(DB_NAME)
-
-# Ensure db_visualizer directory exists
-if not os.path.exists("db_visualizer"):
+    # Create .env file for Node.js visualizer
     os.makedirs("db_visualizer", exist_ok=True)
-    print("Created db_visualizer directory")
-
-try:
     with open("db_visualizer/sqlite.env", "w") as f:
-        f.write(f"export SQLITE_DB=\"{db_path}\"\n")
-    print(f"Environment variables saved to db_visualizer/sqlite.env")
-except Exception as e:
-    print(f"Warning: Could not save environment variables: {e}")
+        f.write(f'export SQLITE_DB="{DB_PATH}"\n')
 
-print("\nSQLite setup complete!")
-print(f"Database: {DB_NAME}")
-print(f"Location: {current_dir}/{DB_NAME}")
-print("")
+    print("Database initialization complete!")
+    print(f"Location: {DB_PATH}")
 
-print("To use with Node.js viewer, run: source db_visualizer/sqlite.env")
-
-print("\nTo connect to the database, use one of the following methods:")
-print(f"1. Python: sqlite3.connect('{DB_NAME}')")
-print(f"2. Connection string: {connection_string}")
-print(f"3. Direct file access: {current_dir}/{DB_NAME}")
-print("")
-
-print("Database statistics:")
-print(f"  Tables: {table_count}")
-print(f"  App info records: {record_count}")
-
-# If sqlite3 CLI is available, show how to use it
-try:
-    import subprocess
-    result = subprocess.run(['which', 'sqlite3'], capture_output=True, text=True)
-    if result.returncode == 0:
-        print("")
-        print("SQLite CLI is available. You can also use:")
-        print(f"  sqlite3 {DB_NAME}")
-except:
-    pass
-
-# Exit successfully
-print("\nScript completed successfully.")
+if __name__ == "__main__":
+    print("Starting Tic Tac Toe database initialization ...")
+    initialize_db()
